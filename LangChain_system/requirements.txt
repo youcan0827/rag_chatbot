@@ -1,5 +1,17 @@
-openai==1.45.0
-faiss-cpu==1.12.0
-pypdf2==3.0.1
-python-dotenv==1.0.0
+# LangChain Core
+langchain==0.3.7
+langchain-community==0.3.5
+langchain-openai==0.2.8
+
+# Vector Stores & Embeddings
+langchain-chroma==0.1.4
+chromadb==0.5.23
 sentence-transformers==5.1.1
+
+# Document Processing
+langchain-text-splitters==0.3.2
+pypdf2==3.0.1
+
+# Environment & Utils
+python-dotenv==1.0.0
+openai==1.45.0

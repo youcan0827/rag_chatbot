@@ -1,203 +1,250 @@
 #!/usr/bin/env python3
 """
-国交省データ RAGチャットボット - LangChain風実装
-シンプルなターミナル版RAGチャットボット
+国交省データ RAGチャットボット - 100% LangChain実装
+LangChainライブラリを完全に活用したRAGシステム
 """
 
 import os
-import PyPDF2
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import faiss
-from openai import OpenAI
 from dotenv import load_dotenv
-import sys
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+from langchain.chains import RetrievalQA
+import tempfile
+import logging
+
+# ログレベル設定
+logging.basicConfig(level=logging.WARNING)
 
 # Hugging Face Tokenizers警告を抑制
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 load_dotenv()
 
-class LangChainStyleRAGChatbot:
+class LangChainRAGChatbot:
     def __init__(self):
-        self.documents = []
-        self.embeddings = None
-        self.index = None
-        self.model = None
-        self.openai_client = None
+        self.vectorstore = None
+        self.qa_chain = None
+        self.retriever = None
         
     def initialize(self):
-        """システム初期化"""
-        print("🚀 システムを初期化しています...")
+        """LangChainシステム初期化"""
+        print("🔗 LangChainシステムを初期化しています...")
         
-        # エンベディングモデル
-        print("📥 エンベディングモデルをロード中...")
-        self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        
-        # OpenRouterクライアント
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        if not api_key:
-            print("❌ OpenRouter APIキーが設定されていません")
+        try:
+            # OpenAI API Key確認
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+            
+            if not openai_api_key and not openrouter_api_key:
+                print("❌ OpenAI または OpenRouter APIキーが設定されていません")
+                return False
+            
+            # LangChain LLM設定
+            if openai_api_key:
+                print("✅ OpenAI APIを使用します")
+                self.llm = ChatOpenAI(
+                    model="gpt-3.5-turbo",
+                    temperature=0.7,
+                    api_key=openai_api_key
+                )
+            else:
+                print("✅ OpenRouter APIを使用します")
+                self.llm = ChatOpenAI(
+                    model="openai/gpt-3.5-turbo",
+                    temperature=0.7,
+                    api_key=openrouter_api_key,
+                    base_url="https://openrouter.ai/api/v1"
+                )
+            
+            # エンベディング設定（多言語対応）
+            print("📥 エンベディングモデルをロード中...")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            
+            print("✅ LangChain初期化完了")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 初期化エラー: {str(e)}")
             return False
-        
-        self.openai_client = OpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1"
-        )
-        print("✅ モデル初期化完了")
-        return True
     
-    def load_pdf(self, pdf_path):
-        """PDFを読み込んでテキストを抽出"""
-        print(f"📄 PDFを読み込み中: {pdf_path}")
+    def load_and_process_pdf(self, pdf_path):
+        """LangChainでPDFを読み込んで処理"""
+        print(f"📄 LangChainでPDFを読み込み中: {pdf_path}")
         
         if not os.path.exists(pdf_path):
             print("❌ PDFファイルが見つかりません")
             return False
         
         try:
-            documents = []
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for i, page in enumerate(pdf_reader.pages):
-                    text = page.extract_text()
-                    if text.strip():
-                        chunks = self.split_text(text, 500)
-                        for j, chunk in enumerate(chunks):
-                            documents.append({
-                                'text': chunk,
-                                'page': i + 1,
-                                'chunk': j + 1,
-                                'source': os.path.basename(pdf_path)
-                            })
+            # LangChain PDFローダー
+            loader = PyPDFLoader(pdf_path)
+            documents = loader.load()
+            print(f"✅ {len(documents)}ページを読み込みました")
             
-            self.documents = documents
-            print(f"✅ {len(documents)}個のテキストチャンクを抽出しました")
+            # LangChain テキスト分割器
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                separators=["\\n\\n", "\\n", "。", "、", " ", ""]
+            )
+            
+            # 文書分割
+            splits = text_splitter.split_documents(documents)
+            print(f"✅ {len(splits)}個のチャンクに分割しました")
+            
+            # サンプルチャンク表示
+            if splits:
+                print(f"📝 サンプルチャンク: {splits[0].page_content[:100]}...")
+            
+            # LangChain ベクトルストア作成（Chroma）
+            print("🔄 Chromaベクトルストアを作成中...")
+            
+            # 一時ディレクトリでChromaDB作成
+            with tempfile.TemporaryDirectory() as temp_dir:
+                self.vectorstore = Chroma.from_documents(
+                    documents=splits,
+                    embedding=self.embeddings,
+                    persist_directory=temp_dir
+                )
+                
+                # メモリ内で使用するために新しいインスタンス作成
+                self.vectorstore = Chroma.from_documents(
+                    documents=splits,
+                    embedding=self.embeddings
+                )
+            
+            print(f"✅ ベクトルストア作成完了（{len(splits)}ドキュメント）")
+            
+            # LangChain リトリーバー作成
+            self.retriever = self.vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 3}
+            )
+            
+            # デバッグ: 検索テスト
+            print("🔍 ベクトルストア検索テスト...")
+            test_results = self.retriever.get_relevant_documents("国土交通省")
+            print(f"📊 テスト検索結果: {len(test_results)}件")
+            
             return True
+            
         except Exception as e:
-            print(f"❌ PDF読み込みエラー: {str(e)}")
+            print(f"❌ PDF処理エラー: {str(e)}")
             return False
     
-    def split_text(self, text, max_length=500):
-        """テキストを指定した長さのチャンクに分割"""
-        sentences = text.split('。')
-        chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk + sentence + "。") <= max_length:
-                current_chunk += sentence + "。"
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + "。"
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return [chunk for chunk in chunks if len(chunk.strip()) > 10]
-    
-    def create_embeddings(self):
-        """エンベディングを作成してFAISSインデックスを構築"""
-        print("🔄 エンベディングを作成中...")
+    def create_qa_chain(self):
+        """LangChain QAチェーン作成"""
+        print("⛓️ LangChain QAチェーンを作成中...")
         
         try:
-            texts = [doc['text'] for doc in self.documents]
-            print(f"📊 エンベディング対象: {len(texts)}個のテキストチャンク")
-            
-            # サンプルテキスト表示
-            if texts:
-                print(f"📝 サンプルテキスト: {texts[0][:100]}...")
-            
-            self.embeddings = self.model.encode(texts, show_progress_bar=True)
-            print(f"📏 エンベディング形状: {self.embeddings.shape}")
-            
-            # FAISSインデックス作成
-            dimension = self.embeddings.shape[1]
-            self.index = faiss.IndexFlatIP(dimension)
-            
-            # 正規化
-            faiss.normalize_L2(self.embeddings)
-            self.index.add(self.embeddings.astype('float32'))
-            
-            # インデックス確認
-            print(f"📊 FAISSインデックス内文書数: {self.index.ntotal}")
-            
-            print(f"✅ エンベディング作成完了（次元: {dimension}）")
-            return True
-        except Exception as e:
-            print(f"❌ エンベディング作成エラー: {str(e)}")
-            return False
-    
-    def search_similar_documents(self, query, k=3):
-        """クエリに類似した文書を検索"""
-        try:
-            query_embedding = self.model.encode([query])
-            faiss.normalize_L2(query_embedding)
-            
-            scores, indices = self.index.search(query_embedding.astype('float32'), k)
-            
-            results = []
-            print(f"🔍 デバッグ: 検索結果 (クエリ: '{query}')")
-            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-                if idx < len(self.documents):
-                    doc = self.documents[idx].copy()
-                    doc['score'] = float(score)
-                    print(f"   {i+1}. スコア: {score:.4f}, ページ{doc['page']}-{doc['chunk']}")
-                    print(f"      テキスト: {doc['text'][:100]}...")
-                    results.append(doc)
-            
-            return results
-        except Exception as e:
-            print(f"❌ 検索エラー: {str(e)}")
-            return []
-    
-    def generate_answer(self, query, context_docs):
-        """OpenAI GPTを使用して回答を生成"""
-        try:
-            context = "\n\n".join([
-                f"【ページ{doc['page']}-{doc['chunk']}】\n{doc['text']}" 
-                for doc in context_docs
-            ])
-            
-            prompt = f"""以下の文書情報に基づいて、質問に日本語で回答してください。
+            # カスタムプロンプトテンプレート
+            template = """あなたは国土交通省の専門文書を分析するアシスタントです。
+以下の文書情報に基づいて、質問に日本語で詳しく回答してください。
 文書に関連する情報がない場合は、「提供された文書にはその情報が含まれておりません」と回答してください。
 
 文書情報:
 {context}
 
-質問: {query}
+質問: {question}
 
 回答:"""
+
+            prompt = ChatPromptTemplate.from_template(template)
             
-            response = self.openai_client.chat.completions.create(
-                model="openai/gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "あなたは国土交通省の文書に基づいて質問に回答する専門アシスタントです。"},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=1000,
-                temperature=0.7
+            # LangChain LCEL (LangChain Expression Language) チェーン
+            def format_docs(docs):
+                return "\\n\\n".join([
+                    f"【ページ{doc.metadata.get('page', 'N/A')}】\\n{doc.page_content}" 
+                    for doc in docs
+                ])
+            
+            self.qa_chain = (
+                {"context": self.retriever | format_docs, "question": RunnablePassthrough()}
+                | prompt
+                | self.llm
+                | StrOutputParser()
             )
             
-            return response.choices[0].message.content.strip()
+            print("✅ LangChain QAチェーン作成完了")
+            return True
+            
         except Exception as e:
-            return f"❌ 回答生成エラー: {str(e)}"
+            print(f"❌ QAチェーン作成エラー: {str(e)}")
+            return False
+    
+    def query(self, question):
+        """LangChainでクエリ実行"""
+        if not self.qa_chain:
+            return "❌ QAチェーンが初期化されていません"
+        
+        try:
+            print("🔍 LangChainで検索・回答生成中...")
+            
+            # 関連文書取得（デバッグ用）
+            relevant_docs = self.retriever.get_relevant_documents(question)
+            print(f"📊 検索結果: {len(relevant_docs)}件の関連文書")
+            
+            for i, doc in enumerate(relevant_docs, 1):
+                page = doc.metadata.get('page', 'N/A')
+                print(f"   {i}. ページ{page}: {doc.page_content[:100]}...")
+            
+            # LangChainチェーン実行
+            response = self.qa_chain.invoke(question)
+            return response
+            
+        except Exception as e:
+            return f"❌ クエリ実行エラー: {str(e)}"
+    
+    def query_with_source(self, question):
+        """ソース情報付きでクエリ実行"""
+        if not self.retriever:
+            return "❌ リトリーバーが初期化されていません", []
+        
+        try:
+            # 関連文書取得
+            relevant_docs = self.retriever.get_relevant_documents(question)
+            
+            # 回答生成
+            answer = self.qa_chain.invoke(question) if self.qa_chain else "QAチェーンエラー"
+            
+            # ソース情報整理
+            sources = []
+            for doc in relevant_docs:
+                sources.append({
+                    'page': doc.metadata.get('page', 'N/A'),
+                    'source': doc.metadata.get('source', 'N/A'),
+                    'content': doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
+                })
+            
+            return answer, sources
+            
+        except Exception as e:
+            return f"❌ クエリ実行エラー: {str(e)}", []
     
     def chat(self):
         """チャットループ"""
-        print("\n" + "="*60)
-        print("🔗 国交省データ RAGチャットボット (LangChain風)")
+        print("\\n" + "="*60)
+        print("🔗 国交省データ RAGチャットボット (100% LangChain)")
         print("="*60)
         print("質問を入力してください。終了するには 'quit' または 'exit' を入力。")
-        print("参照文書を表示するには 'verbose' モードをオンにできます。")
+        print("詳細情報を表示するには 'verbose' モードをオンにできます。")
         print("-"*60)
         
         verbose = False
         
         while True:
             try:
-                user_input = input("\n💬 質問: ").strip()
+                user_input = input("\\n💬 質問: ").strip()
                 
                 if user_input.lower() in ['quit', 'exit', 'q']:
                     print("👋 チャットボットを終了します。")
@@ -212,61 +259,50 @@ class LangChainStyleRAGChatbot:
                 if not user_input:
                     continue
                 
-                print("\n🔍 検索中...")
-                relevant_docs = self.search_similar_documents(user_input, k=3)
-                
-                # 類似度が低すぎる場合のフィルタリング（閾値: 0.3）
-                min_similarity = 0.3
-                filtered_docs = [doc for doc in relevant_docs if doc['score'] >= min_similarity]
-                
-                print(f"📊 検索結果: {len(relevant_docs)}件中{len(filtered_docs)}件が閾値({min_similarity})以上")
-                
-                if filtered_docs:
-                    print("💭 回答生成中...")
-                    answer = self.generate_answer(user_input, filtered_docs)
+                if verbose:
+                    answer, sources = self.query_with_source(user_input)
+                    print(f"\\n🔗 回答: {answer}")
                     
-                    print(f"\n🤖 回答: {answer}")
-                    
-                    if verbose:
-                        print("\n📚 参照した文書:")
+                    if sources:
+                        print("\\n📚 参照したソース:")
                         print("-" * 40)
-                        for i, doc in enumerate(filtered_docs, 1):
-                            print(f"{i}. {doc['source']} - ページ{doc['page']}-{doc['chunk']} (類似度: {doc['score']:.3f})")
-                            print(f"   {doc['text'][:150]}...")
+                        for i, source in enumerate(sources, 1):
+                            print(f"{i}. ページ{source['page']} - {source['source']}")
+                            print(f"   {source['content']}")
                             print()
                 else:
-                    print("❌ 関連する文書が見つかりませんでした。")
-                    print("💡 検索された文書の類似度が低すぎます。より具体的な質問を試してください。")
+                    answer = self.query(user_input)
+                    print(f"\\n🔗 回答: {answer}")
                     
             except KeyboardInterrupt:
-                print("\n\n👋 チャットボットを終了します。")
+                print("\\n\\n👋 チャットボットを終了します。")
                 break
             except Exception as e:
                 print(f"❌ エラー: {str(e)}")
 
 def main():
-    print("🔗 国交省データ RAGチャットボット - LangChain風実装")
-    print("=" * 50)
+    print("🔗 国交省データ RAGチャットボット - 100% LangChain実装")
+    print("=" * 55)
     
-    # OpenRouter APIキー確認
-    if not os.getenv("OPENROUTER_API_KEY"):
-        print("❌ OpenRouter APIキーが設定されていません。")
-        print("💡 .envファイルに OPENROUTER_API_KEY=your_api_key を設定してください。")
+    # APIキー確認
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("OPENROUTER_API_KEY"):
+        print("❌ OpenAI または OpenRouter APIキーが設定されていません。")
+        print("💡 .envファイルに OPENAI_API_KEY または OPENROUTER_API_KEY を設定してください。")
         return
     
     # チャットボット初期化
-    chatbot = LangChainStyleRAGChatbot()
+    chatbot = LangChainRAGChatbot()
     
     if not chatbot.initialize():
         return
     
-    # PDF読み込み
+    # PDF読み込み・処理
     pdf_path = "/Users/yoshinomukanou/Downloads/国交省に関するデータ/国交省①.pdf"
-    if not chatbot.load_pdf(pdf_path):
+    if not chatbot.load_and_process_pdf(pdf_path):
         return
     
-    # エンベディング作成
-    if not chatbot.create_embeddings():
+    # QAチェーン作成
+    if not chatbot.create_qa_chain():
         return
     
     # チャット開始
